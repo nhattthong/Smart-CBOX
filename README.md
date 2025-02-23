@@ -15,7 +15,7 @@ Ver 2.0
 
 Ver 3.0 
 Currently innovation.
-+ LCD menu HUI icon
++ LCD menu UIs icon
 + CAN control
 + MOD changer suitable 
 
