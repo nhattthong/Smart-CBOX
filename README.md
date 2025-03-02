@@ -20,6 +20,5 @@ Currently innovation.
 + LCD menu UIs icon
 + CAN control
 + MOD changer suitable
-+ UWB ![Uploading image.png…]()
-
++ UWB
 
