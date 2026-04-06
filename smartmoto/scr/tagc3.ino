@@ -48,12 +48,17 @@
 #define MIC_LEN         4         // MIC size in bytes (AES-CCM* tag)
 #define PAYLOAD_MAX_LEN 36        // Max plaintext payload length
 
-// ===== AES-128 PRE-SHARED KEY (must match Anchor) =====
-// IMPORTANT: Change this key before production deployment
+// ===== AES-128 PRE-SHARED KEY (must match Anchor stm.ino) =====
+// *** CHANGE THIS KEY BEFORE DEPLOYMENT ***
+// Replace all four words with cryptographically random values.
+// Using a known placeholder here will NOT provide real security.
+// Generate with: python3 -c "import os; d=os.urandom(16); print(','.join(hex(int.from_bytes(d[i:i+4],'big'))+'UL' for i in range(0,16,4)))"
 static const dwt_aes_key_t aes_key = {
-    0xC0FFEE01UL, 0xDEADBEEFUL, 0xCAFEBABEUL, 0x12345678UL,
-    0, 0, 0, 0   // upper 128 bits unused for 128-bit key
+    0xAABBCCDDUL, 0xEEFF0011UL, 0x22334455UL, 0x66778899UL,
+    0, 0, 0, 0   // upper 128 bits unused for AES-128
 };
+// Static assertion: ensure full/empty ADC calibration values differ
+static_assert(BAT_ADC_FULL != BAT_ADC_EMPTY, "BAT ADC calibration error: FULL == EMPTY");
 
 // ===== PIN DEFINITIONS =====
 const uint8_t PIN_DW_CS  = 7;
@@ -137,6 +142,8 @@ void loop() {
 
 // ===== READ BATTERY PERCENT =====
 uint8_t read_battery_percent(void) {
+  // Guard against misconfigured calibration constants
+  if (BAT_ADC_FULL == BAT_ADC_EMPTY) return 50;
   int raw = adc1_get_raw(ADC1_CHANNEL_0);
   int pct = (int)(((long)(raw - BAT_ADC_EMPTY) * 100L) / (BAT_ADC_FULL - BAT_ADC_EMPTY));
   if (pct < 0)   pct = 0;
@@ -228,8 +235,10 @@ void process_poll_and_respond(void) {
   dwt_readrxdata(rx_buffer, frame_len - 2, 0);
 
   // Verify POLL magic in payload (after 9-byte MAC header)
+  // rx_buffer holds (frame_len - 2) bytes; last valid index = (frame_len - 3)
+  int data_len = (int)(frame_len - 2);
   bool is_poll = false;
-  for (int i = 9; i <= (int)(frame_len - 6); i++) {
+  for (int i = 9; i <= data_len - 4; i++) {
     if (rx_buffer[i]   == 'P' && rx_buffer[i+1] == 'O' &&
         rx_buffer[i+2] == 'L' && rx_buffer[i+3] == 'L') {
       is_poll = true;
@@ -249,7 +258,11 @@ void process_poll_and_respond(void) {
   uint8_t seq = rx_buffer[2] + 1;
 
   // --- Random 4-byte nonce (anti-replay) ---
-  uint32_t rand_word = esp_random();
+  // Re-draw if zero to avoid anchor rejecting a legitimate frame (zero nonce = always rejected)
+  uint32_t rand_word;
+  do {
+    rand_word = esp_random();
+  } while (rand_word == 0);
   uint8_t  rand_nonce[4];
   rand_nonce[0] = (uint8_t)(rand_word & 0xFF);
   rand_nonce[1] = (uint8_t)((rand_word >> 8)  & 0xFF);

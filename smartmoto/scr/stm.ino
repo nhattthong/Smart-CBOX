@@ -80,8 +80,10 @@ extern dwt_txconfig_t txconfig_options;
 #define NONCE_HISTORY_SIZE 32       // Ring buffer size (× 4 bytes = 128 bytes)
 
 // ===== AES-128 PRE-SHARED KEY (must match tagc3.ino) =====
+// *** CHANGE THIS KEY BEFORE DEPLOYMENT ***
+// Must be identical to the key in tagc3.ino.
 static const dwt_aes_key_t aes_key = {
-    0xC0FFEE01UL, 0xDEADBEEFUL, 0xCAFEBABEUL, 0x12345678UL,
+    0xAABBCCDDUL, 0xEEFF0011UL, 0x22334455UL, 0x66778899UL,
     0, 0, 0, 0
 };
 
@@ -124,7 +126,8 @@ bool     relay_state     = false;
 uint32_t last_signal_ms  = 0;
 uint8_t  last_bat_pct    = 0;
 
-// ===== NONCE ANTI-REPLAY BUFFER =====
+// AES_STS error bits [5:1]; bit[0] is AES_DONE
+#define AES_STS_ERROR_MASK  0x3E
 static uint32_t nonce_history[NONCE_HISTORY_SIZE] = {0};
 static uint8_t  nonce_history_idx = 0;
 
@@ -428,7 +431,7 @@ bool decrypt_and_verify_payload(uint8_t *rx_data, uint32_t data_len, double meas
   }
   // Check that only DONE bit is set (no error bits)
   // Bits [5:1] are error flags; bit[0] is AES_DONE
-  if ((aes_ret & 0x3E) != 0) {
+  if ((aes_ret & AES_STS_ERROR_MASK) != 0) {
     send_error("DECRYPT");
     return false;
   }

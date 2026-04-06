@@ -262,7 +262,7 @@ footer{text-align:center;color:#444;font-size:10px;padding:4px}
 <script>
 window.onerror=function(m,s,l,c,e){
   appendLog('[JS-ERR] '+m+' '+s+':'+l,'err');
-  return true;
+  return false;  // Allow normal browser error propagation
 };
 function safeGet(o,k,def){
   if(!o||o[k]===undefined||o[k]===null)return def;
@@ -658,12 +658,12 @@ void read_sensors(sensor_data_t *d) {
     }
   }
 
-  // DS18B20
+  // DS18B20  (DEVICE_DISCONNECTED_C = -127.0 from DallasTemperature library, indicates no sensor)
   d->temp_ds_valid = false;
   if (ds18b20_ok) {
     ds18b20.requestTemperatures();
     float t = ds18b20.getTempCByIndex(0);
-    if (t != DEVICE_DISCONNECTED_C) {
+    if (t != DEVICE_DISCONNECTED_C) {  // -127.0°C means sensor disconnected
       d->temp_ds18b20 = t;
       d->temp_ds_valid = true;
     }
@@ -810,10 +810,9 @@ void display_suspension_menu(void) {
 
   u8g2.drawStr(0, 8, "== Suspension ==");
 
-  snprintf(buf, sizeof(buf), "Front: %s",
+  snprintf(buf, sizeof(buf), "Front: %s mm",
            snap.lidar_front_valid ? String(snap.lidar_front_mm).c_str() : "--");
   u8g2.drawStr(0, 20, buf);
-  strcat(buf, "mm");
 
   snprintf(buf, sizeof(buf), "Rear:  %s",
            snap.lidar_rear_valid ? String(snap.lidar_rear_mm).c_str() : "--");
@@ -910,7 +909,7 @@ void handle_api_data(void) {
   }
   fft_snap = current_fft;
 
-  char json[512];
+  char json[768];
   int n = 0;
 
   n += snprintf(json + n, sizeof(json) - n, "{");
@@ -971,7 +970,8 @@ void handle_api_data(void) {
 // ===== HANDLER: GET /api/log =====
 void handle_api_log(void) {
   // Return the newest 20 log entries as JSON array
-  char json[1600];
+  // Use static buffer to avoid large stack allocation in embedded handler
+  static char json[1200];
   int  n = 0;
   n += snprintf(json + n, sizeof(json) - n, "[");
 
