@@ -85,11 +85,11 @@ Key improvements over F103:
 ### 3. ESP32-C3 — Smart Key Fob / Tag (`tagc3.ino`)
 | Parameter | Value |
 |-----------|-------|
-| Role | UWB TWR Responder |
+| Role | UWB TWR Initiator (v3) |
 | UWB | DW3000 SPI (SCK=4, MISO=5, MOSI=6, CS=7) |
-| IRQ/RST | GPIO2 (RTC wake) / GPIO3 |
-| Power | Deep sleep between ranging cycles (~1–2 mA average) |
-| Security | AES-128 CCM* payload, random nonce, 4-byte MIC |
+| IRQ/RST | GPIO2 / GPIO3 |
+| Power | Timer deep-sleep 3 s; DW3000 in reset during sleep (~0.5 mA average) |
+| Security | AES-128 CCM* payload in FINAL frame, random nonce, 4-byte MIC |
 | Battery ADC | GPIO0 (1:2 divider, 12-bit) |
 
 ---
@@ -207,18 +207,27 @@ Sample `/api/data` response:
 ## UWB Smart Key — Security Design
 
 ```
-Tag (ESP32-C3 + DW3000)                   Anchor (STM32F411 + DW3000)
-────────────────────────                  ───────────────────────────────────
-DW3000 receives POLL frame        ←────── Sends POLL frame every 100 ms
-Records poll RX timestamp (T2)            Records poll TX timestamp (T1)
-Sends RESP frame with:            ──────► Records resp RX timestamp (T4)
-  [MAC header 9B]                         Extracts T2, T3 from frame
-  [T2: poll RX  4B]                       Computes: ToF = ((T4-T1)-(T3-T2))/2
-  [T3: resp TX  4B]                       Distance = ToF × c
-  [rand_nonce 4B]                         AKF(distance) → filtered distance
-  [AES-CCM*(CMD:OPEN|BAT:nn) ]            AES-CCM* decrypt + MIC verify
-  [MIC 4B]                                Nonce anti-replay check
-                                          Relay control based on KF distance
+Tag (ESP32-C3 + DW3000)               Anchor (STM32F411 + DW3000)
+─────────────────────────────────     ─────────────────────────────────────────
+[v3 – Tag Initiates, 3-frame DS-TWR, tag polls every 3 s]
+
+Wakes from timer deep-sleep
+Sends POLL frame (T1=TX ts)  ───────► Records T2 = poll RX timestamp
+                                      Computes resp_tx_time from T2
+                                      Embeds T2, T3 in plain RESP frame
+Records T4 = resp RX ts      ◄─────── Sends RESP frame: [MAC 9B][T2:4B][T3:4B]
+Extracts T2, T3 from RESP
+DS-TWR: dist = ((T4-T1)-(T3-T2))/2×c
+AES-CCM* encrypts FINAL:
+  [MAC 9B][T1:4B][T4:4B][nonce:4B]   Records FINAL RX timestamp
+  [AES(CMD:OPEN|DIST:x.xx|BAT:nn)]   Extracts T1, T4 from FINAL header
+  [MIC 4B]                 ───────►  DS-TWR: dist = ((T4-T1)-(T3-T2))/2×c
+                                      AKF(dist_raw) → dist_kf
+DW3000 → reset                        AES-CCM* decrypt + MIC verify
+ESP32-C3 → deep sleep 3 s             Nonce anti-replay check
+                                       Cross-check: |dist_anchor - DIST_payload| < 0.5 m
+                                       Relay control (hysteresis on dist_kf)
+                                       UART → ESP32-S3: STATUS:KEY=..|DIST=..|KF=..
 ```
 
 **Key material**: 128-bit pre-shared AES key (change `aes_key` in both `f411.ino`
