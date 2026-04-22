@@ -81,7 +81,8 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * Hardware
  * ─────────────────────────────────────────────────────────────────────────────
- *  Target: STM32F103C8T6 (BluePill) or ESP32-C3 – any board with DW3000.
+ *  Target: STM32F411CEU6 (BlackPill), STM32F103C8T6 (BluePill), or ESP32-C3 –
+ *          any board with a DW3000 module.
  *  Runs standalone as a PDOA receiver/anchor.
  *
  *  SPI (STM32 defaults):  CLK=PA5, MISO=PA6, MOSI=PA7, CS=PA4

@@ -9,16 +9,17 @@
  * Hardware (same as v1.0):
  *   Primary I2C   (Wire):  SDA=21, SCL=22 – BMI160(0x68), VL53L1X(0x29/0x30), SSD1306(0x3C)
  *   Secondary I2C (Wire1): SDA=4,  SCL=2  – DS1307(0x68), AHT10(0x38)
- *   UART2: RX=17, TX=18 (from STM32F103 PA9)
+ *   UART2: RX=17, TX=18 (from STM32F411 PA9)
  *   SD Card: CS=5
  *   OneWire: GPIO12 (DS18B20)
  *   Menu button: GPIO35
  *
- * New UART protocol from STM32 Anchor:
- *   "STATUS:KEY=ON|DIST=1.23|BAT=85\r\n"  — normal status
+ * New UART protocol from STM32F411 Anchor:
+ *   "STATUS:KEY=ON|DIST=1.23|KF=1.21|Q=0.0010|R=0.0500|BAT=85\r\n"  — normal
  *   "ERR:DECRYPT\r\n"                       — AES MIC failure
  *   "ERR:REPLAY\r\n"                        — nonce replay detected
  *   "ERR:CMD\r\n"                           — unknown command
+ *   "ERR:GATE\r\n"                          — KF outlier gate rejected measurement
  *
  * Web Dashboard:
  *   GET  /         → HTML5 dashboard (auto-refresh via JS)
@@ -125,11 +126,14 @@ typedef struct {
   float temp_ds18b20;
   float temp_aht10, humidity_aht10;
   bool  temp_ds_valid, temp_aht_valid;
-  // Smart key status (from STM32 UART)
-  char  key_status[8];    // "ON" / "OFF"
-  float key_dist_m;       // Measured distance from anchor
-  uint8_t key_bat_pct;    // Tag battery %
-  char  last_err[16];     // Last error string from anchor
+  // Smart key status (from STM32F411 UART)
+  char    key_status[8];    // "ON" / "OFF"
+  float   key_dist_m;       // Raw TWR distance from anchor (m)
+  float   key_kf_dist_m;    // KF-filtered distance from anchor (m)
+  float   key_kf_q;         // AKF process noise Q (learned)
+  float   key_kf_r;         // AKF measurement noise R (learned)
+  uint8_t key_bat_pct;      // Tag battery %
+  char    last_err[16];     // Last error string from anchor
 } sensor_data_t;
 
 typedef struct {
@@ -216,8 +220,12 @@ footer{text-align:center;color:#444;font-size:10px;padding:4px}
     <h2>🔑 Smart Key</h2>
     <div id="keyStatus" class="val">--</div>
     <div style="margin-top:4px">
-      Dist: <span id="keyDist">--</span> m &nbsp;|&nbsp;
-      BAT:  <span id="keyBat">--</span>%
+      Raw: <span id="keyDist">--</span> m &nbsp;|&nbsp;
+      KF:  <span id="keyKfDist">--</span> m &nbsp;|&nbsp;
+      BAT: <span id="keyBat">--</span>%
+    </div>
+    <div style="margin-top:2px;font-size:10px;color:#888">
+      Q: <span id="keyKfQ">--</span> &nbsp;|&nbsp; R: <span id="keyKfR">--</span>
     </div>
     <div id="keyErr" class="chip warn" style="display:none"></div>
   </div>
@@ -305,6 +313,9 @@ function refresh(){
     var ke=document.getElementById('keyStatus');
     if(ke)ke.style.color=ks==='ON'?'#0f0':'#f44';
     setEl('keyDist',(safeGet(d,'key_dist_m',0)).toFixed(2));
+    setEl('keyKfDist',(safeGet(d,'key_kf_dist_m',0)).toFixed(2));
+    setEl('keyKfQ',(safeGet(d,'key_kf_q',0)).toFixed(4));
+    setEl('keyKfR',(safeGet(d,'key_kf_r',0)).toFixed(4));
     setEl('keyBat',safeGet(d,'key_bat_pct',0));
     var errEl=document.getElementById('keyErr');
     var errStr=safeGet(d,'last_err','');
@@ -466,8 +477,11 @@ void task_sensor_reader(void *parameter) {
     // Copy key fields from global state into snap (protected)
     if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       strncpy(snap.key_status, current_sensor.key_status, sizeof(snap.key_status));
-      snap.key_dist_m  = current_sensor.key_dist_m;
-      snap.key_bat_pct = current_sensor.key_bat_pct;
+      snap.key_dist_m    = current_sensor.key_dist_m;
+      snap.key_kf_dist_m = current_sensor.key_kf_dist_m;
+      snap.key_kf_q      = current_sensor.key_kf_q;
+      snap.key_kf_r      = current_sensor.key_kf_r;
+      snap.key_bat_pct   = current_sensor.key_bat_pct;
       strncpy(snap.last_err, current_sensor.last_err, sizeof(snap.last_err));
       // Push sensor data back into shared state
       current_sensor = snap;
@@ -536,6 +550,9 @@ void task_wifi_poster(void *parameter) {
       }
       ERa.virtualWrite(9,  snap.key_bat_pct);
       ERa.virtualWrite(10, snap.key_dist_m);
+      ERa.virtualWrite(11, snap.key_kf_dist_m);
+      ERa.virtualWrite(12, snap.key_kf_q);
+      ERa.virtualWrite(13, snap.key_kf_r);
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
@@ -670,16 +687,19 @@ void read_sensors(sensor_data_t *d) {
   }
 }
 
-// ===== PARSE UART STATUS FROM STM32 =====
+// ===== PARSE UART STATUS FROM STM32F411 =====
 // Expected formats:
-//   "STATUS:KEY=ON|DIST=1.23|BAT=85"
-//   "ERR:DECRYPT" / "ERR:REPLAY" / "ERR:CMD"
+//   "STATUS:KEY=ON|DIST=1.23|KF=1.21|Q=0.0010|R=0.0500|BAT=85"
+//   "ERR:DECRYPT" / "ERR:REPLAY" / "ERR:CMD" / "ERR:GATE"
 void parse_uart_status(const char *line) {
   if (!line || strlen(line) == 0) return;
 
   if (strncmp(line, "STATUS:", 7) == 0) {
     char key_val[8]   = "?";
     float dist_val    = 0.0f;
+    float kf_val      = 0.0f;
+    float q_val       = 0.0f;
+    float r_val       = 0.0f;
     uint8_t bat_val   = 0;
 
     // Parse KEY=
@@ -690,9 +710,21 @@ void parse_uart_status(const char *line) {
       else                             strncpy(key_val, "OFF", sizeof(key_val));
     }
 
-    // Parse DIST=
+    // Parse DIST= (raw TWR distance)
     const char *dp = strstr(line, "DIST=");
-    if (dp) dist_val = atof(dp + 5);
+    if (dp) dist_val = (float)atof(dp + 5);
+
+    // Parse KF= (adaptive KF filtered distance)
+    const char *fp = strstr(line, "KF=");
+    if (fp) kf_val = (float)atof(fp + 3);
+
+    // Parse Q= (learned process noise)
+    const char *qp = strstr(line, "Q=");
+    if (qp) q_val = (float)atof(qp + 2);
+
+    // Parse R= (learned measurement noise)
+    const char *rp = strstr(line, "R=");
+    if (rp) r_val = (float)atof(rp + 2);
 
     // Parse BAT=
     const char *bp = strstr(line, "BAT=");
@@ -700,14 +732,18 @@ void parse_uart_status(const char *line) {
 
     if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
       strncpy(current_sensor.key_status, key_val, sizeof(current_sensor.key_status));
-      current_sensor.key_dist_m  = dist_val;
-      current_sensor.key_bat_pct = bat_val;
-      current_sensor.last_err[0] = '\0';
+      current_sensor.key_dist_m    = dist_val;
+      current_sensor.key_kf_dist_m = kf_val;
+      current_sensor.key_kf_q      = q_val;
+      current_sensor.key_kf_r      = r_val;
+      current_sensor.key_bat_pct   = bat_val;
+      current_sensor.last_err[0]   = '\0';
       xSemaphoreGive(data_mutex);
     }
 
-    add_log("[%s] DIST=%.2f BAT=%u%%",
-            key_val, (double)dist_val, (unsigned)bat_val);
+    add_log("[%s] DIST=%.2f KF=%.2f Q=%.4f R=%.4f BAT=%u%%",
+            key_val, (double)dist_val, (double)kf_val,
+            (double)q_val, (double)r_val, (unsigned)bat_val);
 
   } else if (strncmp(line, "ERR:", 4) == 0) {
     const char *err = line + 4;
@@ -756,9 +792,9 @@ void update_display(void) {
   u8g2.setFont(u8g2_font_5x8_tf);
   char buf[32];
 
-  snprintf(buf, sizeof(buf), "KEY:%s D:%.1fm B:%u%%",
+  snprintf(buf, sizeof(buf), "KEY:%s D:%.1fm KF:%.1fm",
            snap.key_status[0] ? snap.key_status : "?",
-           (double)snap.key_dist_m, (unsigned)snap.key_bat_pct);
+           (double)snap.key_dist_m, (double)snap.key_kf_dist_m);
   u8g2.drawStr(0, 8, buf);
 
   if (snap.lidar_front_valid && snap.lidar_rear_valid) {
@@ -927,9 +963,14 @@ void handle_api_data(void) {
 
   // Smart Key
   n += snprintf(json + n, sizeof(json) - n,
-    "\"key_status\":\"%s\",\"key_dist_m\":%.2f,\"key_bat_pct\":%u,\"last_err\":\"%s\",",
+    "\"key_status\":\"%s\",\"key_dist_m\":%.2f,"
+    "\"key_kf_dist_m\":%.2f,\"key_kf_q\":%.4f,\"key_kf_r\":%.4f,"
+    "\"key_bat_pct\":%u,\"last_err\":\"%s\",",
     snap.key_status[0] ? snap.key_status : "?",
     (double)snap.key_dist_m,
+    (double)snap.key_kf_dist_m,
+    (double)snap.key_kf_q,
+    (double)snap.key_kf_r,
     (unsigned)snap.key_bat_pct,
     snap.last_err);
 
